@@ -1,0 +1,9 @@
+.DS_Store
+.opencode/
+.omp/
+/review.md
+/next_steps.md
+/JOURNAL.md
+/PLAN.md
+/invariants/
+/.nvim-*/
