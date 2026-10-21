@@ -36,6 +36,7 @@ local harnesses = {
 	},
 }
 local term_opts = { count = 1, win = { position = "right", width = 0.4 } }
+local omp_efforts = { "off", "minimal", "low", "medium", "high", "xhigh", "max", "auto" }
 local agy_efforts = { "minimal", "low", "medium", "high", "xhigh", "max" }
 local agy_effort_idx = 4 -- default "high"
 local model_cache = {}
@@ -630,6 +631,51 @@ function M.pick_model()
 	end)
 end
 
+--- Open a dropdown menu to select the thinking/reasoning effort level only
+--- (keeping the current model) in `omp` and `agy`, or trigger the built-in
+--- effort selector/cycle in `codex` and `opencode`.
+function M.pick_thinking()
+	local h_name = current
+	local h = harnesses[h_name]
+	if not h then
+		return notify_err("no harness selected (press <C-.> or <leader>as to select one)", "pick_thinking", "ai")
+	end
+	exit_visual()
+	if vim.fn.mode() == "t" then
+		vim.cmd.stopinsert()
+	end
+	if h_name == "opencode" then
+		send_raw(h, "\20", "pick_thinking")
+		return
+	elseif h_name == "codex" then
+		if not send_paste(h, "/model", true, "pick_thinking") then
+			focus_term(h)
+		end
+		return
+	end
+	local list = (h_name == "omp") and omp_efforts or agy_efforts
+	local items = {}
+	for i, level in ipairs(list) do
+		items[i] = { effort = level, idx = i, text = level }
+	end
+	vim.ui.select(items, {
+		prompt = "Select " .. h.label .. " thinking level:",
+		format_item = function(item)
+			return item.text
+		end,
+	}, function(choice)
+		if not choice then
+			return
+		end
+		if not send_paste(h, "/effort " .. choice.effort, true, "pick_thinking") then
+			if h_name == "agy" then
+				agy_effort_idx = choice.idx
+			end
+			vim.notify("[" .. h_name .. "] effort → " .. choice.effort, vim.log.levels.INFO)
+		end
+	end)
+end
+
 --- Cycle thinking/effort level in the active harness.
 function M.cycle_thinking(direction)
 	local h = harnesses[current]
@@ -666,6 +712,30 @@ function M.setup(opts)
 	if opts.win then
 		term_opts.win = vim.tbl_deep_extend("force", term_opts.win, opts.win)
 	end
+	vim.env.PI_FORCE_IMAGE_PROTOCOL = vim.env.PI_FORCE_IMAGE_PROTOCOL or "kitty"
+	vim.env.PI_KITTY_PLACEHOLDERS = vim.env.PI_KITTY_PLACEHOLDERS or "1"
+	vim.api.nvim_create_autocmd("TermRequest", {
+		group = vim.api.nvim_create_augroup("snacks_terminal_kitty_graphics", { clear = true }),
+		desc = "Forward Kitty graphics APC sequences from terminal buffers to host terminal",
+		callback = function(ev)
+			local seq = ev.data and ev.data.sequence
+			if type(seq) == "string" and seq:find("^\27_G") then
+				local ctrl, payload = seq:match("^(\27_G[^;]*)(;.*)$")
+				if not ctrl then
+					ctrl, payload = seq, ""
+				end
+				-- shortcut: libvterm strips SGR 58:2 (placement_id underline color) on U+10EEEE cells, remove when Neovim preserves SGR 58:2 in terminal buffers
+				ctrl = ctrl:gsub(",p=%d+", "")
+				local out = ctrl .. payload .. "\27\\"
+				local ok, snacks_term = pcall(require, "snacks.image.terminal")
+				if ok and snacks_term and snacks_term.write then
+					snacks_term.write(out)
+				elseif vim.api.nvim_ui_send then
+					vim.api.nvim_ui_send(out)
+				end
+			end
+		end,
+	})
 	if opts.preload_models ~= false then
 		for name, h in pairs(harnesses) do
 			if h.models_cmd and vim.fn.executable(h.cmd) == 1 then
