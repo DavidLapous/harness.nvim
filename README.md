@@ -1,8 +1,11 @@
 # harness.nvim
 
-Lightweight Neovim PTY bridge for terminal AI coding harnesses ([`omp`](https://github.com/can1357/oh-my-pi), `agy` / Antigravity, [`opencode`](https://github.com/sst/opencode), and [`codex`](https://github.com/openai/codex)).
+Lightweight Neovim PTY bridge for terminal AI coding harnesses
+([`omp`](https://github.com/can1357/oh-my-pi), `agy` / Antigravity,
+[`opencode`](https://github.com/sst/opencode), and
+[`codex`](https://github.com/openai/codex)).
 
-Drives the active harness inside `snacks.terminal` directly over its PTY channel using bracketed paste (`\27[200~...\27[201~`)—no socket sidecar or background daemon required.
+Inspired from [opencode.nvim](https://github.com/nickjvandyke/opencode.nvim).
 
 ## Requirements
 
