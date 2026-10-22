@@ -348,6 +348,31 @@ for _, target in ipairs(targets) do
       '\27_Ga=d,d=i,i=9,q=2\27\\',
     })
   end)
+  test('bottom/right/left/top panel position commands and focus preservation', function()
+    local h, s = fresh('omp')
+    h.switch('omp')
+    local t = s.terms.omp
+    t.opts = { position = 'right', wo = { winfixheight = false, winfixwidth = true } }
+    vim.api.nvim_set_current_win(source_win)
+    for _, spec in ipairs({
+      { fn = 'bottom', pos = 'bottom', v = false },
+      { fn = 'right', pos = 'right', v = true },
+      { fn = 'left', pos = 'left', v = true },
+      { fn = 'top', pos = 'top', v = false },
+    }) do
+      h[spec.fn]()
+      eq(t.opts.position, spec.pos)
+      eq(t.opts.wo.winfixwidth, spec.v)
+      eq(t.opts.wo.winfixheight, not spec.v)
+      eq(t:valid(), true)
+      eq(vim.api.nvim_get_current_win(), source_win)
+      eq(s.notices[#s.notices].msg, '[ai] panel → ' .. spec.pos)
+    end
+    vim.api.nvim_set_current_win(t.win)
+    h.bottom()
+    eq(vim.api.nvim_get_current_win(), t.win)
+    vim.api.nvim_set_current_win(source_win)
+  end)
   test('line_locator independent Unicode/token/selection oracle fuzz', function()
     local h = fresh('omp')
     local locator = up(h.ask, 'line_locator')

@@ -377,6 +377,57 @@ function M.toggle()
 	end
 end
 
+local function set_position(pos)
+	term_opts.win.position = pos
+	local ok, st = pcall(require, "snacks.terminal")
+	if not ok then
+		return notify_err(tostring(st), pos, current or "ai")
+	end
+	local cur_win = vim.api.nvim_get_current_win()
+	local vertical = (pos == "left" or pos == "right")
+	for _, name in ipairs(harness_order) do
+		local t = st.get(harnesses[name].cmd, get_term_opts(false))
+		if t then
+			t.opts = type(t.opts) == "table" and t.opts or {}
+			t.opts.position = pos
+			if type(t.opts.wo) == "table" then
+				t.opts.wo.winfixheight = not vertical
+				t.opts.wo.winfixwidth = vertical
+			end
+			if t:valid() then
+				local was_focused = (cur_win == t.win)
+				t:hide()
+				t:show()
+				if was_focused then
+					if t.win and vim.api.nvim_win_is_valid(t.win) then
+						vim.api.nvim_set_current_win(t.win)
+					end
+				elseif vim.api.nvim_win_is_valid(cur_win) then
+					vim.api.nvim_set_current_win(cur_win)
+					vim.cmd.stopinsert()
+				end
+			end
+		end
+	end
+	vim.notify("[ai] panel → " .. pos, vim.log.levels.INFO)
+end
+
+function M.bottom()
+	set_position("bottom")
+end
+
+function M.right()
+	set_position("right")
+end
+
+function M.left()
+	set_position("left")
+end
+
+function M.top()
+	set_position("top")
+end
+
 local function resolve_range(a, b)
 	if a == nil then
 		if vim.fn.mode():match("^[vV\x16]") then

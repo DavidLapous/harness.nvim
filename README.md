@@ -57,6 +57,8 @@ Inspired from [opencode.nvim](https://github.com/nickjvandyke/opencode.nvim).
     { "<leader>at", function() require("harness").pick_thinking() end, mode = "n", desc = "[A]I [T]hinking level" },
     { "<leader>av", function() require("harness").cycle_thinking() end, mode = "n", desc = "Cycle AI thinking level" },
     { "<leader>as", function() require("harness").switch() end, mode = "n", desc = "[A]I [S]witch harness" },
+    { "<leader>ab", function() require("harness").bottom() end, mode = "n", desc = "[A]I [B]ottom" },
+    { "<leader>ar", function() require("harness").right() end, mode = "n", desc = "[A]I [R]ight" },
   },
 }
 ```
@@ -69,6 +71,10 @@ Inspired from [opencode.nvim](https://github.com/nickjvandyke/opencode.nvim).
 | `require("harness").toggle()` | Toggle the active harness terminal split (or open the harness dropdown if none is selected yet). |
 | `require("harness").switch(name?)` | Open the harness dropdown menu (or switch directly to `"omp"`, `"agy"`, `"opencode"`, or `"codex"` if `name` is given) and show its AI panel. |
 | `require("harness").current()` | Return active harness name (`"omp"`, `"agy"`, `"opencode"`, `"codex"`, or `nil` before selection). |
+| `require("harness").bottom()` | Move the harness terminal split to the bottom (`position = "bottom"`). |
+| `require("harness").right()` | Move the harness terminal split to the right (`position = "right"`). |
+| `require("harness").left()` | Move the harness terminal split to the left (`position = "left"`). |
+| `require("harness").top()` | Move the harness terminal split to the top (`position = "top"`). |
 | `require("harness").ask(a?, b?)` | Prompt via `vim.ui.input` prefilled with `path:line at "word": ` (or `at Nth "word"` when repeated on the line, `:col` 1-based byte column when not on an identifier/word, or `path:start-end: ` for multi-line selections) and submit. |
 | `require("harness").prompt_range(a?, b?)` | Paste fenced code excerpt into the active harness composer without submitting. |
 | `require("harness").send_operator()` | `expr = true` operator helper for sending a motion or visual selection (e.g. `go`). |
