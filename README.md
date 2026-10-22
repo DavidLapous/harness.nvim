@@ -26,7 +26,7 @@ Inspired from [opencode.nvim](https://github.com/nickjvandyke/opencode.nvim).
 
 - **Harness dropdown & auto-open**: `require("harness").switch()` (`<leader>as`) opens a dropdown menu (`omp`, `agy`, `opencode`, `codex`) and opens the selected AI panel on acceptance. Pressing `<C-.>` (`toggle()`) when no harness is selected yet also opens this dropdown first.
 - **Terminal image previews**: Forwards Kitty graphics APC sequences (`\27_G...`) and Unicode placeholders (`U+10EEEE`) from `snacks.terminal` buffers to the outer terminal.
-- **No default keymaps**: `require("harness").setup(opts)` binds no keys. Configure your own in `lazy.nvim`.
+- **No default keymaps**: `require("harness").setup(opts)` binds no keys. See below for a `Lazy.nvim` config example.
 
 ## `lazy.nvim` Configuration
 
