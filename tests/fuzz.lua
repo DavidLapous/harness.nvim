@@ -40,7 +40,7 @@ local channels, buffers = {}, {}
 local source = vim.api.nvim_create_buf(true, false)
 vim.api.nvim_set_current_buf(source)
 local source_win = vim.api.nvim_get_current_win()
-for _, name in ipairs({ 'omp', 'agy', 'opencode', 'codex' }) do
+for _, name in ipairs({ 'omp', 'agy', 'opencode', 'codex', 'claude' }) do
   local buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_set_current_buf(buf)
   local chan = vim.fn.jobstart({ '/bin/cat' }, { term = true })
@@ -206,7 +206,7 @@ end
 for _, target in ipairs(targets) do
   active_target = target
   print('\nTARGET ' .. target .. ' SEED ' .. seed .. ' ITERS ' .. iterations)
-  for _, name in ipairs({ 'omp', 'agy', 'opencode', 'codex' }) do
+  for _, name in ipairs({ 'omp', 'agy', 'opencode', 'codex', 'claude' }) do
     test(name .. ': setup/switch/hide/toggle/current/focus', function()
       local h, s = fresh(name)
       eq(h.current(), name)
@@ -215,7 +215,7 @@ for _, target in ipairs(targets) do
       eq(vim.api.nvim_get_current_win(), s.terms[name].win)
       h.toggle(); eq(s.terms[name]:valid(), false)
       h.toggle(); eq(s.terms[name]:valid(), true)
-      for _, next_name in ipairs({ 'codex', 'omp', 'agy', 'opencode', name }) do
+      for _, next_name in ipairs({ 'codex', 'claude', 'omp', 'agy', 'opencode', name }) do
         h.switch(next_name); eq(h.current(), next_name)
         for other, t in pairs(s.terms) do eq(t:valid(), other == next_name) end
       end
@@ -267,13 +267,13 @@ for _, target in ipairs(targets) do
         picker.cb(nil); eq(#s.sends, 0)
         picker.cb(picker.items[1]); eq(body(s), name == 'omp' and '/switch provider/model:low' or '/model gemini-pro-high')
       else
-        eq(body(s), name == 'codex' and '/model' or '/models')
+        eq(body(s), name == 'opencode' and '/models' or '/model')
         eq(s.terms[name]:valid(), true)
         eq(vim.api.nvim_get_current_win(), s.terms[name].win)
       end
       drain(s.deferred)
       h.cycle_thinking()
-      eq(body(s), ({ omp = '\27[Z', agy = '/effort xhigh', opencode = '\20', codex = '/model' })[name])
+      eq(body(s), ({ omp = '\27[Z', agy = '/effort xhigh', opencode = '\20', codex = '/model', claude = '/effort' })[name])
       if name == 'agy' then
         h.cycle_thinking('backward'); eq(body(s), '/effort high')
         for _ = 1, 6 do h.cycle_thinking() end
@@ -298,8 +298,8 @@ for _, target in ipairs(targets) do
           h.cycle_thinking()
           eq(body(s), '/effort minimal')
         end
-      elseif name == 'codex' then
-        eq(body(s), '/model')
+      elseif name == 'codex' or name == 'claude' then
+        eq(body(s), name == 'claude' and '/effort' or '/model')
         eq(s.terms[name]:valid(), true)
         eq(vim.api.nvim_get_current_win(), s.terms[name].win)
       else
@@ -324,14 +324,20 @@ for _, target in ipairs(targets) do
     local h, s = fresh()
     eq(h.current(), nil)
     h.ask(); h.prompt_range(); h.pick_model(); h.pick_thinking(); h.cycle_thinking(); eq(#s.notices, 5)
-    h.toggle(); eq(#s.selects[1].items, 4); s.selects[1].cb(nil); eq(h.current(), nil)
-    h.switch(); s.selects[2].cb(s.selects[2].items[4]); eq(h.current(), 'codex')
+    h.toggle(); s.selects[1].cb(nil); eq(h.current(), nil)
+    h.switch()
+    local claude
+    for _, item in ipairs(s.selects[2].items) do
+      if item.name == 'claude' then claude = item end
+    end
+    assert(claude, 'Claude Code missing from harness picker')
+    s.selects[2].cb(claude); eq(h.current(), 'claude'); eq(s.terms.claude:valid(), true)
     h.setup({ preload_models = true }); eq(#s.systems, 2)
     h.setup({ preload_models = true }); eq(#s.systems, 2)
     local saved = package.loaded['snacks.terminal']
     package.loaded['snacks.terminal'] = nil
     package.preload['snacks.terminal'] = function() error('missing Snacks') end
-    h.switch('omp'); eq(h.current(), 'codex')
+    h.switch('omp'); eq(h.current(), 'claude')
     package.loaded['snacks.terminal'] = saved; package.preload['snacks.terminal'] = nil
   end)
   test('TermRequest Kitty graphics APC passthrough and placement_id normalization', function()
@@ -468,7 +474,7 @@ for _, target in ipairs(targets) do
       '{"models":{"0":{"id":"m"}}}', '{"models":[{"provider":"p","id":"m","thinking":[null,0,false,"high"]}]}',
       '{"models":[{"id":"gpt-xhigh-effort"}]}', '{"models":[{"id":"claude-high"}]}',
       '{"models":[{"id":"unknown-low"}]}' }
-    for _, name in ipairs({ 'omp', 'agy', 'opencode', 'codex', 'unknown' }) do
+    for _, name in ipairs({ 'omp', 'agy', 'opencode', 'codex', 'claude', 'unknown' }) do
       for _, json in ipairs(fixtures) do
         local items, valid = h.parse_model_items(name, json)
         assert(type(items) == 'table' and type(valid) == 'boolean')
@@ -571,8 +577,8 @@ for _, target in ipairs(targets) do
     -- Composer now contains first prompt + excerpt; CR submits both unexpectedly.
     assert(not (#s.sends == 3 and s.sends[3].bytes == '\r'), 'ask CR submits subsequent no-submit excerpt')
   end)
-  test('all four private focus_term paths reopen hidden windows', function()
-    for _, name in ipairs({ 'omp', 'agy', 'opencode', 'codex' }) do
+  test('private focus_term paths reopen hidden windows', function()
+    for _, name in ipairs({ 'omp', 'agy', 'opencode', 'codex', 'claude' }) do
       local h, s = fresh(name)
       local focus = up(h.pick_model, 'focus_term')
       local definitions = up(h.switch, 'harnesses')
@@ -586,10 +592,10 @@ for _, target in ipairs(targets) do
   end)
   test('randomized switch/toggle/setup/ask/paste state machine', function()
     local h, s = fresh('omp')
-    local names = { 'omp', 'agy', 'opencode', 'codex' }
+    local names = { 'omp', 'agy', 'opencode', 'codex', 'claude' }
     local selected, visible = 'omp', {}
     for i = 1, iterations do
-      local name, action = names[math.random(4)], math.random(5)
+      local name, action = names[math.random(#names)], math.random(5)
       if action == 1 then
         h.switch(name); selected = name
         for _, n in ipairs(names) do visible[n] = n == name end
@@ -665,16 +671,19 @@ for _, target in ipairs(targets) do
     vim.api.nvim_buf_delete(invalid, { force = true }); t.buf = invalid
     h.prompt_range(1); eq(s.sends[#s.sends].chan, channels.codex)
   end)
-  test('PTY smoke: actual chan_send delivers marker to terminal job', function()
-    local h, s = fresh('omp')
-    s.real_send = true
-    h.ask(); s.inputs[1].cb('HARNESS_PTY_SMOKE_21102026')
-    drain(s.deferred)
-    local seen = vim.wait(2000, function()
-      return table.concat(vim.api.nvim_buf_get_lines(buffers.omp, 0, -1, false), ''):find('HARNESS_PTY_SMOKE_21102026', 1, true) ~= nil
-    end, 10)
-    assert(seen, 'real PTY did not show marker: ' .. vim.inspect(vim.api.nvim_buf_get_lines(buffers.omp, 0, -1, false)))
-    drain(s.deferred)
+  test('PTY smoke: actual chan_send delivers markers to the selected terminal job', function()
+    for _, name in ipairs({ 'omp', 'claude' }) do
+      local h, s = fresh(name)
+      local marker = 'HARNESS_PTY_SMOKE_' .. name
+      s.real_send = true
+      h.ask(); s.inputs[1].cb(marker)
+      drain(s.deferred)
+      local seen = vim.wait(2000, function()
+        return table.concat(vim.api.nvim_buf_get_lines(buffers[name], 0, -1, false), ''):find(marker, 1, true) ~= nil
+      end, 10)
+      assert(seen, 'real PTY did not show marker: ' .. vim.inspect(vim.api.nvim_buf_get_lines(buffers[name], 0, -1, false)))
+      drain(s.deferred)
+    end
   end)
   test('bounded line_locator profiling on actual implementation', function()
     local h = fresh('omp'); local locator = up(h.ask, 'line_locator')

@@ -1,4 +1,4 @@
--- harness.nvim — Lightweight Neovim PTY bridge for terminal AI harnesses (omp, agy, opencode, codex).
+-- harness.nvim — Lightweight Neovim PTY bridge for terminal AI harnesses (omp, agy, opencode, codex, claude).
 --
 -- Drives the active harness running inside Neovim's snacks.terminal
 -- directly over its PTY channel using bracketed paste (\27[200~...\27[201~).
@@ -8,7 +8,7 @@ local uv = vim.uv or vim.loop
 local M = {}
 
 local current = nil
-local harness_order = { "omp", "agy", "opencode", "codex" }
+local harness_order = { "omp", "agy", "opencode", "codex", "claude" }
 local harnesses = {
 	omp = {
 		name = "omp",
@@ -32,6 +32,12 @@ local harnesses = {
 		name = "codex",
 		cmd = "codex",
 		label = "Codex CLI",
+		model_slash = "/model",
+	},
+	claude = {
+		name = "claude",
+		cmd = "claude",
+		label = "Claude Code",
 		model_slash = "/model",
 	},
 }
@@ -684,7 +690,7 @@ end
 
 --- Open a dropdown menu to select the thinking/reasoning effort level only
 --- (keeping the current model) in `omp` and `agy`, or trigger the built-in
---- effort selector/cycle in `codex` and `opencode`.
+--- effort selector/cycle in `codex`, `claude`, and `opencode`.
 function M.pick_thinking()
 	local h_name = current
 	local h = harnesses[h_name]
@@ -698,8 +704,8 @@ function M.pick_thinking()
 	if h_name == "opencode" then
 		send_raw(h, "\20", "pick_thinking")
 		return
-	elseif h_name == "codex" then
-		if not send_paste(h, "/model", true, "pick_thinking") then
+	elseif h_name == "codex" or h_name == "claude" then
+		if not send_paste(h, h_name == "claude" and "/effort" or "/model", true, "pick_thinking") then
 			focus_term(h)
 		end
 		return
@@ -727,7 +733,7 @@ function M.pick_thinking()
 	end)
 end
 
---- Cycle thinking/effort level in the active harness.
+--- Cycle thinking/effort level, or open the native selector in `codex`/`claude`.
 function M.cycle_thinking(direction)
 	local h = harnesses[current]
 	if not h then
@@ -739,8 +745,8 @@ function M.cycle_thinking(direction)
 	elseif current == "opencode" then
 		send_raw(h, "\20", "cycle_thinking")
 		return
-	elseif current == "codex" then
-		if not send_paste(h, "/model", true, "cycle_thinking") then
+	elseif current == "codex" or current == "claude" then
+		if not send_paste(h, current == "claude" and "/effort" or "/model", true, "cycle_thinking") then
 			focus_term(h)
 		end
 		return
@@ -754,7 +760,7 @@ function M.cycle_thinking(direction)
 	end
 end
 
----@param opts? { default?: "omp"|"agy"|"opencode"|"codex", win?: table, preload_models?: boolean }
+---@param opts? { default?: "omp"|"agy"|"opencode"|"codex"|"claude", win?: table, preload_models?: boolean }
 function M.setup(opts)
 	opts = opts or {}
 	if opts.default and harnesses[opts.default] then
