@@ -567,6 +567,270 @@ local function line_locator(line, col, sel, sel_s)
 	return format_at(cur_tok.word, idx, total)
 end
 
+-- Characterwise Visual pointer: exact byte range plus a short, bounded, escaped hint.
+local SNIPPET_MAX, ANCHOR_MAX = 48, 24
+local TS_COLD_MAX = 32 * 1024
+local CONTROL_ESCAPES = {
+	["\t"] = "\\t",
+	["\n"] = "\\n",
+	["\r"] = "\\r",
+	["\226\128\168"] = "\\u2028",
+	["\226\128\169"] = "\\u2029",
+}
+local QUOTE_ESCAPES = { ['"'] = '\\"', ["\\"] = "\\\\" }
+
+--- Split `s` into UTF-8 characters; invalid, overlong, surrogate and truncated
+--- sequences become one-byte pieces.
+local function utf_chars(s)
+	local t, i = {}, 1
+	while i <= #s do
+		local b, b2 = s:byte(i), s:byte(i + 1) or 0
+		local len = (b >= 0xC2 and b <= 0xDF) and 2 or (b >= 0xE0 and b <= 0xEF) and 3 or (b >= 0xF0 and b <= 0xF4) and 4 or 1
+		if (b == 0xE0 and b2 < 0xA0) or (b == 0xED and b2 > 0x9F) or (b == 0xF0 and b2 < 0x90) or (b == 0xF4 and b2 > 0x8F) then
+			len = 1
+		end
+		for k = i + 1, i + len - 1 do
+			local c = s:byte(k)
+			if not c or c < 0x80 or c > 0xBF then
+				len = 1
+			end
+		end
+		t[#t + 1] = s:sub(i, i + len - 1)
+		i = i + len
+	end
+	return t
+end
+
+--- Concatenate pieces `i..j`, escaping TAB/LF/CR, other C0, DEL and invalid bytes
+--- (`\xhh`), C1 and U+2028/U+2029 (`\uhhhh`), plus `"` and `\` when `quoted`.
+local function render(t, i, j, quoted)
+	local out = {}
+	for k = i, j do
+		local ch = t[k]
+		local b, b2 = ch:byte(1, 2)
+		out[#out + 1] = quoted and QUOTE_ESCAPES[ch]
+			or CONTROL_ESCAPES[ch]
+			or (#ch == 1 and (b < 0x20 or b >= 0x7F)) and string.format("\\x%02x", b)
+			or (b == 0xC2 and b2 < 0xA0) and string.format("\\u%04x", b2)
+			or ch
+	end
+	return table.concat(out)
+end
+
+local function escape_controls(s)
+	local t = utf_chars(s)
+	return render(t, 1, #t)
+end
+
+local function line_len(l)
+	return vim.fn.col({ l, "$" }) - 1
+end
+
+--- Characters of bytes `c1..c2` (inclusive, 1-based; column `len + 1` is the line
+--- break) of line `l`, reading only the first (or last, `from_end`) `4 * (n + 1)`
+--- bytes: the `n` characters at that end are exact; more than `n` means cut.
+local function window(l, c1, c2, n, from_end)
+	local len, w = line_len(l), 4 * (n + 1)
+	if from_end then
+		c1 = math.max(c1, c2 - w + 1)
+	else
+		c2 = math.min(c2, c1 + w - 1)
+	end
+	local last = math.min(c2, len)
+	local text = c1 <= last and vim.api.nvim_buf_get_text(0, l - 1, c1 - 1, l - 1, last, {})[1] or ""
+	return utf_chars(c2 > len and text .. "\n" or text)
+end
+
+--- Quoted pieces `i..j`; `trim` ("left"/"right") drops blanks on that side unless all are blank.
+local function quote(t, i, j, trim)
+	local i2, j2 = i, j
+	while trim == "left" and i2 <= j and t[i2]:match("^%s$") do
+		i2 = i2 + 1
+	end
+	while trim == "right" and j2 >= i and t[j2]:match("^%s$") do
+		j2 = j2 - 1
+	end
+	if i2 <= j2 then
+		i, j = i2, j2
+	end
+	return '"' .. render(t, i, j, true) .. '"'
+end
+
+--- Exact characterwise Visual range as inclusive 1-based byte positions
+--- `(start_line, start_col, end_line, end_col)`, from the two Visual endpoints
+--- only. `nil` (legacy pointer) for 'selection' "old", 'virtualedit' "all",
+--- virtual offsets and regions without a selectable byte.
+local function charwise_bounds()
+	local sel = vim.o.selection
+	local ve = vim.api.nvim_get_option_value("virtualedit", { scope = "local" })
+	ve = "," .. (ve ~= "" and ve or vim.go.virtualedit) .. ","
+	local a, b = vim.fn.getpos("v"), vim.fn.getpos(".")
+	if sel == "old" or ve:find(",all,", 1, true) or a[4] ~= 0 or b[4] ~= 0 then
+		return nil
+	end
+	if b[2] < a[2] or (b[2] == a[2] and b[3] < a[3]) then
+		a, b = b, a
+	end
+	local sl, sc, el = a[2], a[3], b[2]
+	local exclusive = sel == "exclusive" and (a[2] ~= b[2] or a[3] ~= b[3])
+	local blen, ec = line_len(el), nil
+	if exclusive and b[3] == 1 and el > sl then
+		el = el - 1 -- an exclusive end in column 1 keeps the previous line break
+		ec = line_len(el) + 1
+	elseif b[3] > blen and not exclusive then
+		if el < vim.api.nvim_buf_line_count(0) then
+			ec = blen + 1 -- end-of-line position selects the line break
+		elseif blen > 0 then
+			ec = blen -- the buffer's last line break is never selected
+		elseif el > sl then
+			el = el - 1 -- empty last line: the range ends with the previous line break
+			ec = line_len(el) + 1
+		end
+	else
+		-- Last byte of the end character: one line only, from A or from column 1.
+		local from = sl == el and a or { 0, el, 1, 0 }
+		local ok, r = pcall(vim.fn.getregionpos, from, b, { type = "v", exclusive = exclusive })
+		ec = ok and type(r) == "table" and r[1] and r[1][2][3] or nil
+	end
+	if not ec or ec < 1 or ec > line_len(el) + 1 or el < sl or (el == sl and ec < sc) then
+		return nil
+	end
+	return sl, sc, el, ec
+end
+
+local function python_function_name(fn, buf)
+	local name = fn:field("name")[1]
+	return name and vim.treesitter.get_node_text(name, buf)
+end
+
+local CPP_NAME_TYPES = {
+	identifier = true,
+	field_identifier = true,
+	qualified_identifier = true,
+	destructor_name = true,
+	operator_name = true,
+}
+
+--- Common C++ definitions only; other declarators are omitted.
+local function cpp_function_name(fn, buf)
+	local d = fn:field("declarator")[1]
+	while d and (d:type() == "pointer_declarator" or d:type() == "reference_declarator") do
+		d = d:field("declarator")[1] or d:named_child(0)
+	end
+	d = d and d:type() == "function_declarator" and d:field("declarator")[1]
+	if not d or not CPP_NAME_TYPES[d:type()] then
+		return nil
+	end
+	local name = vim.treesitter.get_node_text(d, buf)
+	if fn:field("type")[1] or d:type() == "destructor_name" then
+		return name
+	end
+	-- No return type: constructors/destructors only, not macro calls such as `TEST(a, b) { ... }`.
+	local scope, last = name:match("([^:]+)::(~?[^:]+)$")
+	if scope then
+		return (scope:gsub("%b<>", ""):gsub("%s", "")) == last:gsub("^~", "") and name or nil
+	end
+	local body = fn:parent()
+	local class = body and body:type() == "field_declaration_list" and body:parent()
+	local cname = class and class:field("name")[1]
+	return cname and vim.treesitter.get_node_text(cname, buf) == name and name or nil
+end
+
+--- Innermost `function_definition` containing the 0-based point (r, c).
+local function function_at(root, r, c)
+	local node = root:named_descendant_for_range(r, c, r, c)
+	while node do
+		if node:type() == "function_definition" then
+			local r1, c1, r2, c2 = node:range()
+			if (r1 < r or (r1 == r and c1 <= c)) and (r < r2 or (r == r2 and c < c2)) then
+				return node
+			end
+		end
+		node = node:parent()
+	end
+end
+
+--- Name of the innermost Python/C++ function containing both selected endpoints,
+--- from an up-to-date tree or a synchronous parse of a small buffer. `nil` for
+--- other filetypes, missing parsers, large unparsed buffers, syntax errors,
+--- endpoints in different functions and unnamed or unusual definitions.
+local function ts_function_name(sl, sc, el, ec)
+	local buf = vim.api.nvim_get_current_buf()
+	local ok, name = pcall(function()
+		local lang = vim.treesitter.language.get_lang(vim.bo[buf].filetype)
+		local name_of = (lang == "python" and python_function_name) or (lang == "cpp" and cpp_function_name)
+		if not name_of then
+			return nil
+		end
+		local small = vim.api.nvim_buf_get_offset(buf, vim.api.nvim_buf_line_count(buf)) <= TS_COLD_MAX
+		local hl = vim.treesitter.highlighter.active[buf]
+		local parser = small and vim.treesitter.get_parser(buf, lang, { error = false }) or (hl and hl.tree)
+		if not parser or parser:lang() ~= lang then
+			return nil
+		end
+		local trees = parser:is_valid(true) and parser:trees() or (small and parser:parse())
+		local root = trees and trees[1] and trees[1]:root()
+		if not root or root:has_error() then
+			return nil
+		end
+		local fn = function_at(root, sl - 1, sc - 1)
+		local fn2 = function_at(root, el - 1, ec - 1)
+		if not fn or not fn2 or not fn:equal(fn2) then
+			return nil
+		end
+		local text = name_of(fn, buf)
+		text = text and text:gsub("%s+", " ")
+		return text and text ~= "" and #text <= 120 and escape_controls(text) or nil
+	end)
+	return ok and name or nil
+end
+
+local function pointer_path()
+	local name = vim.api.nvim_buf_get_name(0)
+	if name == "" then
+		return "[No Name]"
+	end
+	return escape_controls((vim.fs.relpath and vim.fs.relpath(get_term_opts(false).cwd, name)) or name)
+end
+
+--- Pointer for an implicit characterwise Visual selection, e.g.
+--- `src/a.py:4:9-12 "a, b" (in build)` or
+--- `src/a.py:4:9-7:3 from "sort(runs)" to "limit" (in build)`.
+local function charwise_pointer()
+	local sl, sc, el, ec = charwise_bounds()
+	if not sl then
+		return nil
+	end
+	local parts = { pointer_path() .. ":" .. sl .. ":" .. sc .. "-" .. (el ~= sl and el .. ":" or "") .. ec }
+	if vim.bo.modified then
+		parts[#parts + 1] = "[unsaved]"
+	end
+	if sl == el then
+		local t = window(sl, sc, ec, SNIPPET_MAX)
+		if #t <= SNIPPET_MAX then
+			parts[#parts + 1] = quote(t, 1, #t)
+		else
+			local u = window(sl, sc, ec, ANCHOR_MAX, true)
+			parts[#parts + 1] = quote(t, 1, ANCHOR_MAX) .. "…" .. quote(u, #u - ANCHOR_MAX + 1, #u)
+		end
+	else
+		-- Start anchor to the end of its line, end anchor from the start of its line.
+		local t = window(sl, sc, math.max(sc, line_len(sl)), ANCHOR_MAX)
+		local u = window(el, 1, ec, ANCHOR_MAX, true)
+		parts[#parts + 1] = "from "
+			.. quote(t, 1, math.min(#t, ANCHOR_MAX), "right")
+			.. (#t > ANCHOR_MAX and "…" or "")
+			.. " to "
+			.. (#u > ANCHOR_MAX and "…" or "")
+			.. quote(u, math.max(1, #u - ANCHOR_MAX + 1), #u, "left")
+	end
+	local fn = ts_function_name(sl, sc, el, ec)
+	if fn then
+		parts[#parts + 1] = "(in " .. fn .. ")"
+	end
+	return table.concat(parts, " ")
+end
+
 --- Collect a prompt in Neovim's input dialog and submit it to the active
 --- harness with the cursor line or visual selection range as a read pointer.
 ---@param a integer? start line (default: visual selection or cursor line)
@@ -575,22 +839,28 @@ function M.ask(a, b)
 	local mode = (a == nil) and vim.fn.mode() or ""
 	local cur_pos = vim.api.nvim_win_get_cursor(0)
 	local cur_line, col = cur_pos[1], cur_pos[2] + 1
+	local h = harnesses[current]
+	local pointer = h and mode == "v" and charwise_pointer() or nil
 	local sel, sel_s
-	if (mode == "v" or mode == "\x16") and vim.fn.line("v") == vim.fn.line(".") then
+	if not pointer and (mode == "v" or mode == "\x16") and vim.fn.line("v") == vim.fn.line(".") then
 		sel = (vim.fn.getregion(vim.fn.getpos("v"), vim.fn.getpos("."), { type = mode })[1]) or ""
 		sel_s = math.min(vim.fn.col("v"), vim.fn.col("."))
 	end
 	a, b = resolve_range(a, b)
-	local h = harnesses[current]
 	if not h then
 		return notify_err("no harness selected (press <C-.> or <leader>as to select one)", "ask", "ai")
 	end
-	local loc = ""
-	if a == b and a == cur_line and mode ~= "V" then
-		local line = vim.api.nvim_buf_get_lines(0, a - 1, a, false)[1] or ""
-		loc = line_locator(line, col, sel, sel_s)
+	local prefix
+	if pointer then
+		prefix = pointer .. ": "
+	else
+		local loc = ""
+		if a == b and a == cur_line and mode ~= "V" then
+			local line = vim.api.nvim_buf_get_lines(0, a - 1, a, false)[1] or ""
+			loc = line_locator(line, col, sel, sel_s)
+		end
+		prefix = M.range_ref(a, b) .. loc .. ": "
 	end
-	local prefix = M.range_ref(a, b) .. loc .. ": "
 	vim.ui.input({ prompt = "[" .. h.name .. "] ", default = prefix }, function(text)
 		if text == nil or text:match("^%s*$") then
 			return

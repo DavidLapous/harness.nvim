@@ -196,6 +196,82 @@ local function oracle(line, col, selected, selected_start)
   end
   return ' at ' .. (count > 1 and ordinal(index) .. ' ' or '') .. '"' .. text .. '"'
 end
+-- Independent oracle for the characterwise Visual pointer: characters via
+-- strcharpart/char2nr (not str_utf_pos/byte decoding), full selected text from
+-- an actual Visual yank instead of windowed buffer reads.
+local function chars_of(s)
+  local t = {}
+  for i = 0, vim.fn.strchars(s) - 1 do t[#t + 1] = vim.fn.strcharpart(s, i, 1) end
+  return t
+end
+local named_escapes = { ['"'] = '\\"', ['\\'] = '\\\\', ['\t'] = '\\t', ['\n'] = '\\n', ['\r'] = '\\r' }
+local function oracle_quote(s)
+  local out = {}
+  for _, ch in ipairs(chars_of(s)) do
+    local cp = vim.fn.char2nr(ch)
+    out[#out + 1] = named_escapes[ch] or ((cp < 32 or cp == 127) and ('\\x%02x'):format(cp))
+      or (((cp >= 0x80 and cp <= 0x9f) or cp == 0x2028 or cp == 0x2029) and ('\\u%04x'):format(cp)) or ch
+  end
+  return '"' .. table.concat(out) .. '"'
+end
+local function oracle_pointer(name, sl, sc, el, ec, text, modified)
+  local head = name .. ':' .. sl .. ':' .. sc .. '-' .. (el ~= sl and (el .. ':') or '') .. ec
+    .. (modified and ' [unsaved]' or '')
+  local t = chars_of(text)
+  if sl == el then
+    if #t <= 48 then return head .. ' ' .. oracle_quote(text) end
+    return head .. ' ' .. oracle_quote(table.concat(t, '', 1, 24)) .. '…' .. oracle_quote(table.concat(t, '', #t - 23))
+  end
+  local first, start_anchor = text:match('^[^\n]*'), oracle_quote('\n')
+  if first ~= '' then
+    local f = chars_of(first)
+    local s = table.concat(f, '', 1, math.min(#f, 24))
+    local trimmed = s:gsub('%s+$', '')
+    start_anchor = oracle_quote(trimmed ~= '' and trimmed or s) .. (#f > 24 and '…' or '')
+  end
+  local nl = text:sub(-1) == '\n' and '\n' or ''
+  local last = chars_of((nl == '' and text or text:sub(1, -2)):match('[^\n]*$') .. nl)
+  local s = table.concat(last, '', math.max(1, #last - 23))
+  local trimmed = s:gsub('^%s+', '')
+  return head .. ' from ' .. start_anchor .. ' to ' .. (#last > 24 and '…' or '') .. oracle_quote(trimmed ~= '' and trimmed or s)
+end
+-- Cursor positions reachable in real Visual mode: starts of characters with
+-- their composing characters (byteidx counts those with the base character).
+local function grapheme_starts(line)
+  local t = {}
+  for i = 0, vim.fn.strchars(line, 1) - 1 do t[#t + 1] = vim.fn.byteidx(line, i) + 1 end
+  return #t > 0 and t or { 1 }
+end
+-- Check a characterwise Visual ask() prompt against the same selection yanked
+-- in real Visual mode (`gv` reselects it after ask() leaves Visual mode).
+local function check_charwise(prompt, context, reselect)
+  local lines = vim.api.nvim_buf_get_lines(source, 0, -1, false)
+  if reselect then reselect() else normal('gv') end
+  vim.cmd.normal({ args = { 'y' }, bang = true, mods = { silent = true } })
+  local yank, mark = vim.fn.getreg('"'), vim.fn.getpos("'[")
+  local ctx = '\n' .. (context or '') .. ' ' .. vim.o.selection .. ' ' .. vim.inspect(lines) .. ' ' .. vim.inspect(prompt)
+  if yank == '' then
+    assert(not prompt:find('^%[No Name%]:%d+:%d+%-'), 'empty region must keep legacy pointer' .. ctx)
+    return
+  end
+  local sl, sc, el, ec = prompt:match('^%[No Name%]:(%d+):(%d+)%-(%d+):(%d+) ')
+  if not sl then
+    sl, sc, ec = prompt:match('^%[No Name%]:(%d+):(%d+)%-(%d+) ')
+    el = sl
+  end
+  assert(sl, 'missing exact range' .. ctx)
+  sl, sc, el, ec = tonumber(sl), tonumber(sc), tonumber(el), tonumber(ec)
+  local parts = {}
+  for l = sl, el do
+    local s = lines[l] .. (l < #lines and '\n' or '')
+    parts[#parts + 1] = s:sub(l == sl and sc or 1, l == el and ec or -1)
+  end
+  eq(table.concat(parts), yank, 'range bytes differ from Visual yank' .. ctx)
+  -- '[ is the yank start, clamped to the last character when the start is a line break.
+  local len = #lines[sl]
+  eq({ mark[2], mark[3] == sc or (sc == len + 1 and mark[3] == math.max(len, 1)) }, { sl, true }, 'start mark' .. ctx)
+  eq(prompt, oracle_pointer('[No Name]', sl, sc, el, ec, yank, vim.bo[source].modified) .. ': ', 'hint' .. ctx)
+end
 local atoms = { 'a', 'Z', '_', '0', '9', ' ', '\t', '%', '^', '$', '(', ')', '.', '[', ']', '*', '+', '-', '?',
   'é', '界', 'α', 'Ж', '🙂', '𝛼', 'é', '́', '中', 'ß', '́́' }
 local function random_line(n)
@@ -446,16 +522,27 @@ for _, target in ipairs(targets) do
         local selected = vim.fn.getregion(vim.fn.getpos('v'), vim.fn.getpos('.'), { type = mode })[1]
         local col = vim.fn.col('.')
         h.ask()
-        local expected = mode == 'V' and '[No Name]:1: ' or '[No Name]:1' .. oracle(line, col, selected, start) .. ': '
-        eq(s.inputs[#s.inputs].opts.default, expected, 'visual fuzz ' .. i .. ' ' .. vim.inspect(line))
         eq(vim.fn.mode(), 'n')
+        if mode == 'v' then
+          -- Recreate the same API-placed Visual selection (possibly on a composing
+          -- character, which `gv` would normalize) and compare with its direct yank.
+          check_charwise(s.inputs[#s.inputs].opts.default, 'visual fuzz ' .. i, function()
+            vim.api.nvim_win_set_cursor(0, { 1, a - 1 }); normal('v')
+            vim.api.nvim_win_set_cursor(0, { 1, b - 1 })
+          end)
+        else
+          local expected = mode == 'V' and '[No Name]:1: ' or '[No Name]:1' .. oracle(line, col, selected, start) .. ': '
+          eq(s.inputs[#s.inputs].opts.default, expected, 'visual fuzz ' .. i .. ' ' .. vim.inspect(line))
+        end
       end
     end
     for _, mode in ipairs({ 'v', 'V', '\22' }) do
       for _, backward in ipairs({ false, true }) do
         reset_source({ 'alpha', 'beta', 'gamma' }, backward and 3 or 1)
         normal(mode); vim.api.nvim_win_set_cursor(0, { backward and 1 or 3, 0 })
-        h.ask(); eq(s.inputs[#s.inputs].opts.default, '[No Name]:1-3: ')
+        h.ask()
+        eq(s.inputs[#s.inputs].opts.default, mode == 'v' and '[No Name]:1:1-3:1 [unsaved] from "alpha" to "g": '
+          or '[No Name]:1-3: ')
       end
     end
   end)
@@ -465,7 +552,361 @@ for _, target in ipairs(targets) do
     vim.o.selection = 'exclusive'
     normal('v'); vim.api.nvim_win_set_cursor(0, { 1, 5 })
     eq(vim.fn.getregion(vim.fn.getpos('v'), vim.fn.getpos('.'), { type = 'v', exclusive = true })[1], 'alpha')
-    h.ask(); eq(s.inputs[1].opts.default, '[No Name]:1 at "alpha": ')
+    h.ask(); eq(s.inputs[1].opts.default, '[No Name]:1:1-5 [unsaved] "alpha": ')
+    -- Blockwise keeps the legacy single-line locator.
+    reset_source({ 'alpha beta' })
+    vim.o.selection = 'exclusive'
+    normal('\22'); vim.api.nvim_win_set_cursor(0, { 1, 5 })
+    h.ask(); eq(s.inputs[2].opts.default, '[No Name]:1 at "alpha": ')
+  end)
+  test('ask charwise v pointer matches actual Visual yank (multiline fuzz)', function()
+    local h, s = fresh('omp')
+    for i = 1, math.floor(iterations / 4) do
+      local lines = {}
+      for k = 1, math.random(1, 4) do lines[k] = math.random(4) == 1 and '' or random_line(math.random(0, 60)) end
+      reset_source(lines)
+      vim.o.selection = math.random(2) == 1 and 'inclusive' or 'exclusive'
+      if math.random(3) == 1 then vim.bo[source].modified = false end
+      local function pick()
+        local l = math.random(#lines)
+        local starts = grapheme_starts(lines[l])
+        return { l, starts[math.random(#starts)] - 1 }
+      end
+      vim.api.nvim_win_set_cursor(0, pick()); normal('v')
+      vim.api.nvim_win_set_cursor(0, pick())
+      local keys = ({ '', '', '$', 'o$o' })[math.random(4)]
+      if keys ~= '' then normal(keys) end
+      eq(vim.fn.mode(), 'v')
+      h.ask()
+      eq(vim.fn.mode(), 'n')
+      check_charwise(s.inputs[#s.inputs].opts.default, 'charwise fuzz ' .. i .. ' keys=' .. keys)
+    end
+  end)
+  test('ask charwise v exact pointers: repeated, reversed, exclusive, Unicode, line breaks', function()
+    local h, s = fresh('omp')
+    local function ask_v(lines, a, b, opts)
+      opts = opts or {}
+      reset_source(lines)
+      vim.o.selection = opts.selection or 'inclusive'
+      if opts.saved then vim.bo[source].modified = false end
+      vim.api.nvim_win_set_cursor(0, a); normal('v'); vim.api.nvim_win_set_cursor(0, b)
+      if opts.keys then normal(opts.keys) end
+      h.ask()
+      eq(vim.fn.mode(), 'n')
+      local prompt = s.inputs[#s.inputs].opts.default
+      if vim.o.selection ~= 'old' then check_charwise(prompt, vim.inspect({ a, b, opts })) end
+      return prompt
+    end
+    -- Repeated text: coordinates disambiguate identical snippets; partial tokens keep exact bytes.
+    eq(ask_v({ 'foo foo foo' }, { 1, 4 }, { 1, 6 }), '[No Name]:1:5-7 [unsaved] "foo": ')
+    eq(ask_v({ 'foo foo foo' }, { 1, 6 }, { 1, 4 }), '[No Name]:1:5-7 [unsaved] "foo": ')
+    eq(ask_v({ 'foo foo foo' }, { 1, 9 }, { 1, 10 }), '[No Name]:1:10-11 [unsaved] "oo": ')
+    eq(ask_v({ 'let (a, b) = pair;' }, { 1, 5 }, { 1, 8 }, { saved = true }), '[No Name]:1:6-9 "a, b": ')
+    -- Exclusive: the end character is excluded, equal endpoints select one character,
+    -- and an end in column 1 keeps the previous line break.
+    eq(ask_v({ 'alpha beta' }, { 1, 5 }, { 1, 0 }, { selection = 'exclusive' }), '[No Name]:1:1-5 [unsaved] "alpha": ')
+    eq(ask_v({ 'alpha beta' }, { 1, 2 }, { 1, 2 }, { selection = 'exclusive' }), '[No Name]:1:3-3 [unsaved] "p": ')
+    eq(ask_v({ 'alpha', 'beta' }, { 1, 2 }, { 2, 0 }, { selection = 'exclusive' }), '[No Name]:1:3-6 [unsaved] "pha\\n": ')
+    eq(ask_v({ 'alpha', 'beta' }, { 2, 0 }, { 1, 2 }, { selection = 'exclusive' }), '[No Name]:1:3-6 [unsaved] "pha\\n": ')
+    -- Unicode: a(1) é(2-3) 界(4-6) 🙂(7-10) b(11); the end covers every byte of its character.
+    eq(ask_v({ 'aé界🙂b' }, { 1, 3 }, { 1, 6 }), '[No Name]:1:4-10 [unsaved] "界🙂": ')
+    eq(ask_v({ 'aé界🙂b' }, { 1, 6 }, { 1, 3 }), '[No Name]:1:4-10 [unsaved] "界🙂": ')
+    eq(ask_v({ 'aé界🙂b' }, { 1, 3 }, { 1, 6 }, { selection = 'exclusive' }), '[No Name]:1:4-6 [unsaved] "界": ')
+    eq(ask_v({ 'aé界🙂b' }, { 1, 6 }, { 1, 6 }, { selection = 'exclusive' }), '[No Name]:1:7-10 [unsaved] "🙂": ')
+    eq(ask_v({ 'é́x' }, { 1, 0 }, { 1, 0 }), '[No Name]:1:1-4 [unsaved] "é́": ')
+    -- Line breaks are column (line length + 1); the buffer's last line break is never selected.
+    eq(ask_v({ 'ab', 'cd' }, { 1, 0 }, { 1, 0 }, { keys = '$' }), '[No Name]:1:1-3 [unsaved] "ab\\n": ')
+    eq(ask_v({ 'ab', 'cd' }, { 1, 0 }, { 1, 0 }, { keys = '$', selection = 'exclusive' }), '[No Name]:1:1-2 [unsaved] "ab": ')
+    eq(ask_v({ 'ab', '', 'cd' }, { 2, 0 }, { 2, 0 }), '[No Name]:2:1-1 [unsaved] "\\n": ')
+    eq(ask_v({ 'ab', '', 'cd' }, { 2, 0 }, { 2, 0 }, { selection = 'exclusive' }), '[No Name]:2:1-1 [unsaved] "\\n": ')
+    eq(ask_v({ 'ab', '', 'cd' }, { 1, 1 }, { 2, 0 }), '[No Name]:1:2-2:1 [unsaved] from "b" to "\\n": ')
+    eq(ask_v({ 'ab', 'cd' }, { 2, 0 }, { 2, 0 }, { keys = '$' }), '[No Name]:2:1-2 [unsaved] "cd": ')
+    eq(ask_v({ 'ab', '' }, { 1, 1 }, { 2, 0 }), '[No Name]:1:2-3 [unsaved] "b\\n": ')
+    eq(ask_v({ 'ab', '' }, { 2, 0 }, { 2, 0 }), '[No Name]:2:1: ') -- empty region: legacy pointer
+    eq(ask_v({ 'ab', 'cd' }, { 1, 1 }, { 2, 0 }, { keys = 'o$o' }), '[No Name]:1:3-2:1 [unsaved] from "\\n" to "c": ')
+    -- Multiline: exact endpoints; anchors are bounded and trimmed only on their open side.
+    local code = { '    total = sort(runs, &cfg)   ', '    x = 1', '        limit + 1' }
+    eq(ask_v(code, { 1, 12 }, { 3, 12 }), '[No Name]:1:13-3:13 [unsaved] from "sort(runs, &cfg)" to "limit": ')
+    eq(ask_v(code, { 3, 12 }, { 1, 12 }), '[No Name]:1:13-3:13 [unsaved] from "sort(runs, &cfg)" to "limit": ')
+    eq(ask_v(code, { 1, 0 }, { 2, 3 }), '[No Name]:1:1-2:4 [unsaved] from "    total = sort(runs, &"… to "    ": ')
+    -- Typed keys through an `x` mapping, as with the README keymap.
+    vim.keymap.set('x', '<F9>', function() h.ask() end, { buffer = source })
+    local function typed(lines, keys)
+      reset_source(lines)
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(keys .. '<F9>', true, false, true), 'xt', false)
+      eq(vim.fn.mode(), 'n')
+      return s.inputs[#s.inputs].opts.default
+    end
+    eq(typed({ 'foo(bar, baz) foo' }, '4lvl'), '[No Name]:1:5-6 [unsaved] "ba": ')
+    eq(typed({ 'foo(bar, baz) foo' }, '$vb'), '[No Name]:1:15-17 [unsaved] "foo": ')
+    eq(typed({ 'aé界🙂b', 'next' }, 'lvl$'), '[No Name]:1:2-12 [unsaved] "é界🙂b\\n": ')
+    eq(typed({ 'one', 'two', 'three' }, 'lvjjo'), '[No Name]:1:2-3:2 [unsaved] from "ne" to "th": ')
+    vim.keymap.del('x', '<F9>', { buffer = source })
+    -- 'selection' "old" keeps the legacy locator.
+    eq(ask_v({ 'alpha beta' }, { 1, 0 }, { 1, 4 }, { selection = 'old' }), '[No Name]:1 at "alpha": ')
+  end)
+  test('ask charwise v escapes and bounds snippets without breaking UTF-8', function()
+    local h, s = fresh('omp')
+    -- quote, backslash, TAB, CR, ESC, DEL, C1 NEL, U+2028, U+2029, é, invalid byte, truncated sequence
+    local nasty = 'q"\\\t\r\27\127\194\133\226\128\168\226\128\169é\255\226\128'
+    local esc = [[q\"\\\t\r\x1b\x7f\u0085\u2028\u2029é\xff\xe2\x80]]
+    local line = nasty .. string.rep('x', 60) .. nasty
+    reset_source({ line })
+    normal('v'); vim.api.nvim_win_set_cursor(0, { 1, #line - 1 })
+    h.ask()
+    local prompt = s.inputs[1].opts.default
+    -- 14 characters at each end (a truncated sequence is two invalid bytes).
+    eq(prompt, '[No Name]:1:1-' .. #line .. ' [unsaved] "' .. esc .. string.rep('x', 10) .. '"…"'
+      .. string.rep('x', 10) .. esc .. '": ')
+    assert(not prompt:find('[%z\1-\31\127]'), 'raw control byte in prompt')
+    -- Overlong, surrogate and beyond-U+10FFFF encodings are invalid bytes, not characters.
+    reset_source({ '\224\128\128|\237\160\128|\244\144\128\128|\240\159\153\130' })
+    normal('v$')
+    h.ask()
+    eq(s.inputs[#s.inputs].opts.default,
+      [[[No Name]:1:1-17 [unsaved] "\xe0\x80\x80|\xed\xa0\x80|\xf4\x90\x80\x80|🙂": ]])
+    reset_source({ 'say "hi"\\n', 'x' })
+    normal('v'); vim.api.nvim_win_set_cursor(0, { 1, 9 }); normal('$')
+    h.ask(); eq(s.inputs[#s.inputs].opts.default, [[[No Name]:1:1-11 [unsaved] "say \"hi\"\\n\n": ]])
+    -- Huge lines: exact coordinates, bounded hint, bounded reads, one single-line getregionpos().
+    local read, get_text, get_lines = 0, vim.api.nvim_buf_get_text, vim.api.nvim_buf_get_lines
+    local getregionpos, regions = vim.fn.getregionpos, {}
+    local ok, err = pcall(function()
+      reset_source({ string.rep('a', 200000), string.rep('é', 100000), string.rep('b', 200000) })
+      vim.fn.getregionpos = function(p1, p2, opts)
+        regions[#regions + 1] = { p1[2], p2[2] }
+        return getregionpos(p1, p2, opts)
+      end
+      vim.api.nvim_buf_get_text = function(...)
+        local chunk = get_text(...)
+        for _, l in ipairs(chunk) do read = read + #l end
+        return chunk
+      end
+      vim.api.nvim_buf_get_lines = function() error('charwise pointer must not read whole lines') end
+      vim.api.nvim_win_set_cursor(0, { 1, 99 }); normal('v'); vim.api.nvim_win_set_cursor(0, { 3, 198999 })
+      local started = vim.uv.hrtime()
+      h.ask()
+      print(string.format('PROFILE charwise ask 500KB selection elapsed_ms=%.3f read_bytes=%d',
+        (vim.uv.hrtime() - started) / 1e6, read))
+      eq(s.inputs[#s.inputs].opts.default, '[No Name]:1:100-3:199000 [unsaved] from "' .. string.rep('a', 24) .. '"… to …"'
+        .. string.rep('b', 24) .. '": ')
+      eq(regions, { { 3, 3 } })
+      vim.api.nvim_win_set_cursor(0, { 2, 2 }); normal('v'); vim.api.nvim_win_set_cursor(0, { 2, 199996 })
+      h.ask()
+      eq(s.inputs[#s.inputs].opts.default, '[No Name]:2:3-199998 [unsaved] "' .. string.rep('é', 24) .. '"…"'
+        .. string.rep('é', 24) .. '": ')
+      eq(regions, { { 3, 3 }, { 2, 2 } })
+    end)
+    vim.api.nvim_buf_get_text, vim.api.nvim_buf_get_lines, vim.fn.getregionpos = get_text, get_lines, getregionpos
+    assert(ok, err)
+    assert(read <= 600, 'read too many bytes: ' .. read)
+  end)
+  test('ask charwise v: virtualedit all keeps the legacy pointer; path controls are escaped', function()
+    local h, s = fresh('omp')
+    local ve = { 'all', '' } -- global, window-local ('' inherits the global value)
+    local function ask_v(lines, a, b, keys)
+      reset_source(lines) -- resets 'virtualedit'
+      vim.go.virtualedit = ve[1]
+      vim.api.nvim_set_option_value('virtualedit', ve[2], { scope = 'local' })
+      vim.api.nvim_win_set_cursor(0, a); normal('v'); vim.api.nvim_win_set_cursor(0, b)
+      if keys then normal(keys) end
+      h.ask()
+      eq(vim.fn.mode(), 'n')
+      return s.inputs[#s.inputs].opts.default
+    end
+    local global_ve = vim.go.virtualedit
+    local original_cwd, original_name = vim.uv.cwd(), vim.api.nvim_buf_get_name(source)
+    local ok, err = pcall(function()
+      local function exact(p) return p:match('^%[No Name%]:%d+:%d+%-') ~= nil end
+      eq(ask_v({ 'alpha beta' }, { 1, 0 }, { 1, 4 }), '[No Name]:1 at "alpha": ')
+      eq(exact(ask_v({ 'a\tb', 'cd' }, { 1, 0 }, { 1, 1 })), false) -- inside the tab
+      eq(exact(ask_v({ 'ab', 'cd' }, { 1, 0 }, { 1, 0 }, '$')), false) -- end of line
+      ve = { '', 'block,all' }
+      eq(exact(ask_v({ 'a\tb', 'cd' }, { 1, 0 }, { 1, 1 })), false)
+      ve = { 'all', 'onemore' } -- the local value wins
+      eq(ask_v({ 'alpha beta' }, { 1, 0 }, { 1, 4 }), '[No Name]:1:1-5 [unsaved] "alpha": ')
+      -- Control characters in the buffer path stay on one escaped line; legacy paths are unchanged.
+      reset_source({ 'alpha beta' })
+      vim.api.nvim_buf_set_name(source, script_dir .. '/x\ty\nw\rz\27\194\133\226\128\168é.lua')
+      vim.api.nvim_set_current_dir(script_dir)
+      normal('v'); vim.api.nvim_win_set_cursor(0, { 1, 4 })
+      h.ask()
+      local prompt = s.inputs[#s.inputs].opts.default
+      eq(prompt, [[x\ty\nw\rz\x1b\u0085\u2028é.lua:1:1-5 [unsaved] "alpha": ]])
+      assert(not prompt:find('[%z\1-\31\127]'), 'raw control byte in prompt')
+      eq(h.range_ref(1, 1), 'x\ty\nw\rz\27\194\133\226\128\168é.lua:1')
+    end)
+    vim.go.virtualedit = global_ve
+    vim.api.nvim_set_option_value('virtualedit', '', { scope = 'local' })
+    vim.api.nvim_set_current_dir(original_cwd)
+    vim.api.nvim_buf_set_name(source, original_name)
+    assert(ok, err)
+  end)
+  -- Select (a..b) charwise in `lines` with `filetype` and return the ask() prompt.
+  local function ask_ft(h, s, filetype, lines, a, b, keys)
+    reset_source(lines)
+    vim.bo[source].filetype = filetype
+    vim.bo[source].modified = false
+    vim.api.nvim_win_set_cursor(0, a); normal('v'); vim.api.nvim_win_set_cursor(0, b)
+    if keys then normal(keys) end
+    h.ask()
+    return s.inputs[#s.inputs].opts.default
+  end
+  local function fn_name(prompt)
+    return prompt:match(' %(in (.-)%): $')
+  end
+  test('ask charwise v Tree-sitter names (actual Python/C++ parsers when installed)', function()
+    local h, s = fresh('omp')
+    local ok, err = pcall(function()
+      if vim.treesitter.language.add('python') then
+        local py = {
+          'class A:', -- 1
+          '    @staticmethod', -- 2
+          '    def m(x):', -- 3
+          '        def inner(y):', -- 4
+          '            return y', -- 5
+          '        return inner(x)', -- 6
+          '', -- 7
+          'async def g():', -- 8
+          '    f = lambda z: z', -- 9
+          '    return f', -- 10
+        }
+        eq(ask_ft(h, s, 'python', py, { 5, 12 }, { 5, 19 }), '[No Name]:5:13-20 "return y" (in inner): ')
+        eq(fn_name(ask_ft(h, s, 'python', py, { 6, 22 }, { 4, 12 })), nil) -- outer/inner boundary, backward
+        eq(fn_name(ask_ft(h, s, 'python', py, { 6, 8 }, { 6, 22 })), 'm')
+        eq(fn_name(ask_ft(h, s, 'python', py, { 3, 4 }, { 6, 22 })), 'm') -- whole definition
+        eq(fn_name(ask_ft(h, s, 'python', py, { 9, 8 }, { 9, 18 })), 'g') -- lambda: enclosing named function
+        eq(fn_name(ask_ft(h, s, 'python', py, { 6, 8 }, { 8, 4 })), nil) -- cross-function
+        eq(fn_name(ask_ft(h, s, 'python', py, { 6, 8 }, { 6, 8 }, '$')), nil) -- line break after the body
+        eq(fn_name(ask_ft(h, s, 'python', py, { 2, 4 }, { 3, 10 })), nil) -- decorator outside function node
+        eq(fn_name(ask_ft(h, s, 'python', py, { 1, 0 }, { 1, 4 })), nil) -- class scope
+        eq(fn_name(ask_ft(h, s, 'python', { 'def f(:', '    return 1' }, { 2, 4 }, { 2, 9 })), nil) -- malformed
+        local exact = ask_ft(h, s, 'python', py, { 4, 12 }, { 6, 22 })
+        eq(exact, '[No Name]:4:13-6:23 from "inner(y):" to "return inner(x)": ')
+        local siblings = { 'def outer():', '    def a():', '        return 1', '    def b():', '        return 2' }
+        eq(fn_name(ask_ft(h, s, 'python', siblings, { 3, 8 }, { 5, 15 })), nil) -- nested siblings
+        eq(fn_name(ask_ft(h, s, 'python', siblings, { 3, 8 }, { 3, 15 })), 'a')
+        eq(fn_name(ask_ft(h, s, 'python', siblings, { 2, 4 }, { 4, 7 })), nil) -- outer start, inner end
+      else
+        print('SKIP Python parser unavailable')
+      end
+      if vim.treesitter.language.add('cpp') then
+        local cpp = {
+          'namespace ns {', -- 1
+          'template <typename T>', -- 2
+          'struct Foo {', -- 3
+          '  Foo(int x) : v(x) {}', -- 4
+          '  ~Foo() {}', -- 5
+          '  int get() const { return v; }', -- 6
+          '  operator bool() const { return true; }', -- 7
+          '  int v;', -- 8
+          '};', -- 9
+          'template <typename T>', -- 10
+          'Foo<T>::Foo(int x) : v(x) {}', -- 11
+          'int *ptr(int a) { return nullptr; }', -- 12
+          'int &ref(int a) { static int z; return z; }', -- 13
+          'auto outer(int a) -> int {', -- 14
+          '  auto f = [&](int b) { return a + b; };', -- 15
+          '  return f(a);', -- 16
+          '}', -- 17
+          'bool Foo<int>::operator==(const Foo &o) const { return true; }', -- 18
+          'TEST(Suite, Name) { int q = 1; }', -- 19
+          'Foo::Bar(int x) { int r = x; }', -- 20
+          '}', -- 21
+        }
+        local cases = {
+          { { 4, 15 }, { 4, 18 }, 'Foo' }, -- in-class constructor
+          { { 5, 2 }, { 5, 10 }, '~Foo' },
+          { { 6, 20 }, { 6, 28 }, 'get' },
+          { { 7, 26 }, { 7, 37 }, nil }, -- conversion operator: omitted
+          { { 11, 22 }, { 11, 27 }, 'Foo<T>::Foo' }, -- scoped template constructor
+          { { 12, 18 }, { 12, 32 }, 'ptr' },
+          { { 13, 30 }, { 13, 40 }, 'ref' },
+          { { 15, 24 }, { 15, 32 }, 'outer' }, -- lambda body: enclosing named function
+          { { 15, 0 }, { 16, 5 }, 'outer' },
+          { { 18, 50 }, { 18, 60 }, 'Foo<int>::operator==' },
+          { { 19, 22 }, { 19, 26 }, nil }, -- macro-shaped definition without return type
+          { { 20, 20 }, { 20, 26 }, nil }, -- scoped, no return type, not a constructor
+          { { 12, 20 }, { 13, 10 }, nil }, -- cross-function
+          { { 9, 0 }, { 9, 1 }, nil }, -- class scope
+        }
+        for _, case in ipairs(cases) do
+          eq(fn_name(ask_ft(h, s, 'cpp', cpp, case[1], case[2])), case[3], vim.inspect(case))
+        end
+        eq(ask_ft(h, s, 'cpp', cpp, { 6, 20 }, { 6, 28 }), '[No Name]:6:21-29 "return v;" (in get): ')
+        eq(fn_name(ask_ft(h, s, 'cpp', { 'int f() {', '  int x = (;', '  return x;', '}' }, { 3, 2 }, { 3, 9 })), nil)
+        -- MISSING ';' inside the function (no ERROR ancestor): still malformed, omitted.
+        eq(fn_name(ask_ft(h, s, 'cpp', { 'int f() {', '  int x = 1', '  return x;', '}' }, { 3, 2 }, { 3, 9 })), nil)
+        eq(fn_name(ask_ft(h, s, 'cpp', { 'int f() {', '  int x = 1;', '  return x;', '}' }, { 3, 2 }, { 3, 9 })), 'f')
+        local nested = { 'struct S {', '  int a() { return 1; }', '  int b() { return 2; }', '};',
+          'int g() {', '  struct L { int h() { return 3; } };', '  return 0;', '}' }
+        eq(fn_name(ask_ft(h, s, 'cpp', nested, { 2, 13 }, { 3, 13 })), nil) -- sibling methods
+        eq(fn_name(ask_ft(h, s, 'cpp', nested, { 6, 30 }, { 7, 9 })), nil) -- inner start, outer end
+        eq(fn_name(ask_ft(h, s, 'cpp', nested, { 7, 2 }, { 7, 9 })), 'g')
+      else
+        print('SKIP C++ parser unavailable')
+      end
+    end)
+    vim.bo[source].filetype = ''
+    assert(ok, err)
+  end)
+  test('ask charwise v Tree-sitter omission: other filetypes, missing/broken parser, large buffer', function()
+    local h, s = fresh('omp')
+    local get_parser, calls = vim.treesitter.get_parser, 0
+    local ok, err = pcall(function()
+      vim.treesitter.get_parser = function(...)
+        calls = calls + 1
+        return get_parser(...)
+      end
+      -- LaTeX/plaintext: exact coordinates and anchors, no macro semantics or parser use.
+      eq(ask_ft(h, s, 'tex', { '\\section{Intro} \\emph{x}' }, { 1, 16 }, { 1, 23 }),
+        '[No Name]:1:17-24 "\\\\emph{x}": ')
+      eq(ask_ft(h, s, 'text', { 'def f():', '    return 1' }, { 2, 4 }, { 2, 11 }), '[No Name]:2:5-12 "return 1": ')
+      eq(calls, 0)
+      -- Large Python buffer: skipped before creating or running a parser.
+      local big = {}
+      for i = 1, 8000 do big[i] = 'def f' .. i .. '():\n    return 1' end
+      big = vim.split(table.concat(big, '\n'), '\n')
+      local started = vim.uv.hrtime()
+      eq(ask_ft(h, s, 'python', big, { 2, 4 }, { 2, 11 }), '[No Name]:2:5-12 "return 1": ')
+      print(string.format('PROFILE charwise ask large python elapsed_ms=%.3f', (vim.uv.hrtime() - started) / 1e6))
+      eq(calls, 0)
+      -- Missing or failing parser: the pointer is unchanged, without a name.
+      vim.treesitter.get_parser = function() calls = calls + 1; return nil, 'no parser' end
+      eq(ask_ft(h, s, 'python', { 'def f():', '    return 1' }, { 2, 4 }, { 2, 11 }), '[No Name]:2:5-12 "return 1": ')
+      vim.treesitter.get_parser = function() calls = calls + 1; error('broken parser') end
+      eq(ask_ft(h, s, 'cpp', { 'int f() {', '  return 1;', '}' }, { 2, 2 }, { 2, 10 }), '[No Name]:2:3-11 "return 1;": ')
+      eq(calls, 2)
+      -- Normal, linewise and blockwise pointers stay unchanged in a supported filetype.
+      vim.treesitter.get_parser = get_parser
+      reset_source({ 'def f():', '    return 1' }, 2, 4)
+      vim.bo[source].filetype = 'python'
+      h.ask(); eq(s.inputs[#s.inputs].opts.default, '[No Name]:2 at "return": ')
+      normal('V'); h.ask(); eq(s.inputs[#s.inputs].opts.default, '[No Name]:2: ')
+      normal('\22'); vim.api.nvim_win_set_cursor(0, { 2, 9 }); h.ask()
+      eq(s.inputs[#s.inputs].opts.default, '[No Name]:2 at "return": ')
+      h.ask(2, 2); eq(s.inputs[#s.inputs].opts.default, '[No Name]:2 at "return": ') -- explicit range: legacy
+    end)
+    vim.treesitter.get_parser = get_parser
+    vim.bo[source].filetype = ''
+    assert(ok, err)
+  end)
+  test('ask charwise v keeps the cwd-relative path of the receiving terminal', function()
+    local h, s = fresh('omp')
+    local original_cwd, original_name = vim.uv.cwd(), vim.api.nvim_buf_get_name(source)
+    h.switch('omp')
+    reset_source({ 'alpha beta' })
+    vim.api.nvim_buf_set_name(source, script_dir .. '/fuzz_reference_only.lua')
+    vim.api.nvim_set_current_dir(script_dir)
+    local ok, err = pcall(function()
+      normal('v'); vim.api.nvim_win_set_cursor(0, { 1, 4 })
+      h.ask()
+      local ref = h.range_ref(1, 1):gsub(':1$', '')
+      eq(s.inputs[1].opts.default, ref .. ':1:1-5 [unsaved] "alpha": ')
+    end)
+    vim.api.nvim_set_current_dir(original_cwd)
+    vim.api.nvim_buf_set_name(source, original_name)
+    assert(ok, err)
   end)
   test('parse_model_items schemas and malformed/partial JSON fuzz', function()
     local h = fresh()

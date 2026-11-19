@@ -82,10 +82,50 @@ actions open Claude's native slider rather than tracking or cycling levels in Ne
 | `require("harness").right()` | Move the harness terminal split to the right (`position = "right"`). |
 | `require("harness").left()` | Move the harness terminal split to the left (`position = "left"`). |
 | `require("harness").top()` | Move the harness terminal split to the top (`position = "top"`). |
-| `require("harness").ask(a?, b?)` | Prompt via `vim.ui.input` prefilled with `path:line at "word": ` (or `at Nth "word"` when repeated on the line, `:col` 1-based byte column when not on an identifier/word, or `path:start-end: ` for multi-line selections) and submit. |
+| `require("harness").ask(a?, b?)` | Prompt via `vim.ui.input` prefilled with a pointer and submit. Characterwise Visual (`v`) selections get an exact byte range (see [Selection pointer](#selection-pointer)); otherwise `path:line at "word": ` (or `at Nth "word"` when repeated on the line, `:col` 1-based byte column when not on an identifier/word, or `path:start-end: ` for multi-line linewise/blockwise selections and explicit `a`/`b` ranges). |
 | `require("harness").prompt_range(a?, b?)` | Paste fenced code excerpt into the active harness composer without submitting. |
 | `require("harness").send_operator()` | `expr = true` operator helper for sending a motion or visual selection (e.g. `go`). |
 | `require("harness").send_line()` | `expr = true` operator helper for sending the current line (e.g. `goo`). |
 | `require("harness").pick_model()` | Open `vim.ui.select` (`snacks.picker`) with provider, model, and reasoning effort subword search (`omp`, `agy`) or open the built-in TUI model dialog (`opencode`, `codex`, `claude`). |
 | `require("harness").pick_thinking()` | Open `vim.ui.select` dropdown to switch reasoning effort only while keeping the current model (`/effort <level>` in `omp`/`agy`, `/model` in `codex`, `/effort` in `claude`, `<C-t>` in `opencode`). |
 | `require("harness").cycle_thinking(direction?)` | Cycle reasoning effort (`"forward"` default, or `"backward"` for `agy`); open the native selector instead in `codex`/`claude`. |
+
+## Selection pointer
+
+`ask()` called from characterwise Visual mode (`v`, no explicit range) prefills
+one editable line naming the exact selected bytes (the prefill ends with `: `):
+
+```text
+src/index.cpp:42:50-53 "a, b" (in build_index):
+src/index.cpp:42:26-45:9 from "sort(runs, &cfg)" to "limit" (in build_index):
+```
+
+- Coordinates are `line:start_col-end_col` or `start_line:start_col-end_line:end_col`:
+  1-based, inclusive UTF-8 byte columns of the region Visual mode selects, computed
+  from the two Visual endpoints only (`getregionpos()` on the end line plus
+  'selection'). Both endpoints are always shown, order is normalized for backward
+  selections, and the end column is the last byte of the last selected character.
+  A selected line break (`$`, an empty line, or an exclusive end in column 1) is
+  column `line length + 1`; the buffer's last line break is never selected.
+- The quoted hint is the selection when it has at most 48 characters, otherwise
+  its first and last 24 characters joined by `…`. Multi-line selections show a
+  start anchor (from the start to the end of its line) and an end anchor (from
+  the start of its line to the end), at most 24 characters each, with blanks
+  trimmed only on the side away from the coordinate. Hints escape `"`, `\`, tab,
+  LF, CR, other C0 controls, DEL and invalid bytes (`\xhh`), and C1 controls and
+  U+2028/U+2029 (`\uhhhh`); the path gets the same control escapes, so the
+  pointer stays on one line. Only a few hundred bytes at the ends are read.
+- `[unsaved]` follows the coordinates when the buffer is modified.
+- `(in NAME)` names the innermost Python or C++ function/method that contains
+  both selected endpoints, using an installed parser via `vim.treesitter` (no
+  LSP, no parser installation). Buffers up to 32 KiB are parsed on demand;
+  larger ones only use an up-to-date tree from an active Tree-sitter
+  highlighter. It is omitted for other filetypes, missing parsers, syntax
+  errors anywhere in the buffer, endpoints in different functions (including
+  nested siblings and an outer/inner pair; a selected line break after a
+  function's last line is outside it), and unnamed or unusual definitions
+  (lambdas resolve to their enclosing named function; C++ definitions without
+  a return type are named only when they are constructors or destructors).
+- `'selection'` `old`, `'virtualedit'` containing `all` (window-local value, or
+  the global one when that is empty), virtual positions and regions without a
+  selectable byte keep the line pointer described in the API table.
