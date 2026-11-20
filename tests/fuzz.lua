@@ -102,12 +102,17 @@ local function fresh(name)
     if s.lookup_missing and opts.create == false then return nil end
     local t = s.terms[cmd]
     if not t and opts.create ~= false then
-      t = { buf = buffers[cmd], cmd = cmd }
+      -- Like Snacks: a private copy of the window config, whose `wo` is set
+      -- window-locally on every window opened for this terminal.
+      t = { buf = buffers[cmd], cmd = cmd, opts = vim.deepcopy(opts.win or {}) }
       function t:valid() return self.win ~= nil and vim.api.nvim_win_is_valid(self.win) end
       function t:show()
         if not self:valid() then
           self.win = vim.api.nvim_open_win(self.buf, false, { relative = 'editor', row = 0, col = 0,
             width = 30, height = 5, style = 'minimal' })
+          for k, v in pairs(self.opts.wo or {}) do
+            vim.api.nvim_set_option_value(k, v, { scope = 'local', win = self.win })
+          end
         end
       end
       function t:hide()
@@ -454,6 +459,70 @@ for _, target in ipairs(targets) do
     h.bottom()
     eq(vim.api.nvim_get_current_win(), t.win)
     vim.api.nvim_set_current_win(source_win)
+  end)
+  test('owned panes keep their buffer (winfixbuf) across switch/focus/toggle/position; others untouched', function()
+    local function wfb(win) return vim.api.nvim_get_option_value('winfixbuf', { scope = 'local', win = win }) end
+    local events = { 'TermOpen', 'TermEnter', 'TermLeave', 'BufWinEnter', 'BufEnter', 'WinNew', 'WinEnter' }
+    local autocmds = #vim.api.nvim_get_autocmds({ event = events })
+    local h, s = fresh('omp')
+    local focus = up(h.pick_model, 'focus_term')
+    local definitions = up(h.switch, 'harnesses')
+    -- A terminal the plugin does not own, in a regular split.
+    vim.cmd('split')
+    local other_win, other_buf = vim.api.nvim_get_current_win(), vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_win_set_buf(other_win, other_buf)
+    local other_chan = vim.fn.jobstart({ '/bin/cat' }, { term = true })
+    vim.b[other_buf].snacks_terminal = { cmd = 'lazygit' }
+    vim.api.nvim_set_current_win(source_win)
+    local ok, err = pcall(function()
+      local function check(name)
+        local t = s.terms[name]
+        eq({ t:valid(), wfb(t.win), vim.api.nvim_win_get_buf(t.win) == t.buf }, { true, true, true }, name)
+        eq({ wfb(source_win), wfb(other_win) }, { false, false }, 'unrelated windows: ' .. name)
+        return t
+      end
+      h.switch('omp')
+      local t = check('omp')
+      eq(vim.api.nvim_get_current_win(), t.win)
+      -- Replacing the buffer of the owned pane directly is refused; the pane keeps its terminal.
+      for _, cmd in ipairs({ 'hide buffer ' .. source, 'buffer ' .. source, 'bnext' }) do
+        local refused, e = pcall(vim.cmd, cmd)
+        eq(refused, false, cmd)
+        assert(tostring(e):find('E1513', 1, true), tostring(e))
+        eq({ vim.api.nvim_get_current_win(), vim.api.nvim_win_get_buf(t.win) }, { t.win, t.buf }, cmd)
+      end
+      -- Focus and the managed lifecycle are unaffected, and every reopened window is pinned.
+      vim.api.nvim_set_current_win(source_win)
+      focus(definitions.omp); vim.cmd.stopinsert()
+      eq(vim.api.nvim_get_current_win(), t.win)
+      h.switch('claude'); eq(t:valid(), false); check('claude') -- switched away from inside the owned pane
+      eq(vim.api.nvim_get_current_win(), s.terms.claude.win)
+      h.switch('omp'); check('omp')
+      h.toggle(); eq(t:valid(), false)
+      h.toggle(); check('omp')
+      t:hide(); vim.api.nvim_set_current_win(source_win)
+      focus(definitions.omp); vim.cmd.stopinsert(); check('omp')
+      for _, pos in ipairs({ 'bottom', 'left', 'top', 'right' }) do
+        local before, vertical = t.win, pos == 'left' or pos == 'right'
+        h[pos](); check('omp')
+        assert(t.win ~= before, 'position change must reopen the window')
+        eq({ t.opts.position, t.opts.wo.winfixbuf, vim.wo[t.win].winfixwidth, vim.wo[t.win].winfixheight },
+          { pos, true, vertical, not vertical }, pos)
+      end
+      -- setup() window options are merged with the pin.
+      h.setup({ win = { wo = { wrap = false } }, preload_models = false })
+      h.switch('codex'); check('codex')
+      eq({ s.terms.codex.opts.width, s.terms.codex.opts.wo }, { 0.4, { winfixbuf = true, wrap = false } })
+      eq(vim.wo[s.terms.codex.win].wrap, false)
+      -- Never set globally nor through autocommands.
+      eq(vim.api.nvim_get_option_value('winfixbuf', { scope = 'global' }), false)
+      eq(#vim.api.nvim_get_autocmds({ event = events }), autocmds)
+    end)
+    vim.fn.jobstop(other_chan)
+    if vim.api.nvim_win_is_valid(other_win) then vim.api.nvim_win_close(other_win, true) end
+    pcall(vim.api.nvim_buf_delete, other_buf, { force = true })
+    vim.api.nvim_set_current_win(source_win)
+    assert(ok, err)
   end)
   test('line_locator independent Unicode/token/selection oracle fuzz', function()
     local h = fresh('omp')
@@ -1065,6 +1134,7 @@ for _, target in ipairs(targets) do
     local h, s = fresh('omp')
     h.switch('omp')
     local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_set_current_win(source_win) -- the focused owned pane is pinned ('winfixbuf')
     vim.api.nvim_set_current_buf(buf)
     local chan = vim.fn.jobstart({ '/bin/cat' }, { term = true })
     s.terms.omp.buf = buf

@@ -41,7 +41,8 @@ local harnesses = {
 		model_slash = "/model",
 	},
 }
-local term_opts = { count = 1, win = { position = "right", width = 0.4 } }
+-- 'winfixbuf' is window-local and applied by Snacks to each window it opens for these terminals only.
+local term_opts = { count = 1, win = { position = "right", width = 0.4, wo = { winfixbuf = true } } }
 local omp_efforts = { "off", "minimal", "low", "medium", "high", "xhigh", "max", "auto" }
 local agy_efforts = { "minimal", "low", "medium", "high", "xhigh", "max" }
 local agy_effort_idx = 4 -- default "high"
